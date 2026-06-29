@@ -148,4 +148,4 @@ jobs:
             exit 1
           fi
 
-          echo "Checkov report generated successfully. Gate did not block this run."
+          echo "Checkov report generated successfully! Gate did not block this run."

@@ -11,10 +11,10 @@ on:
         options:
           - vulnerable
           - improved
-      soft_fail:
-        description: Report-only mode. Use true for demo, false to fail the build on findings.
+      enforce_gate:
+        description: Fail the workflow when Checkov finds failed checks
         required: true
-        default: true
+        default: false
         type: boolean
   pull_request:
   push:
@@ -23,6 +23,8 @@ on:
 
 permissions:
   contents: read
+  actions: read
+  security-events: write
 
 jobs:
   checkov:
@@ -30,40 +32,119 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Resolve scan settings
+        id: cfg
+        shell: bash
+        run: |
+          SCAN_PATH="${{ github.event.inputs.scan_path }}"
+          ENFORCE_GATE="${{ github.event.inputs.enforce_gate }}"
+
+          if [ -z "$SCAN_PATH" ]; then
+            SCAN_PATH="vulnerable"
+          fi
+
+          if [ -z "$ENFORCE_GATE" ]; then
+            ENFORCE_GATE="false"
+          fi
+
+          echo "scan_path=$SCAN_PATH" >> "$GITHUB_OUTPUT"
+          echo "enforce_gate=$ENFORCE_GATE" >> "$GITHUB_OUTPUT"
+          echo "category=checkov-$SCAN_PATH" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=checkov-results-$SCAN_PATH-run-${{ github.run_number }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: '3.13'
+          cache: pip
 
       - name: Install Checkov
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install checkov
 
-      - name: Run Checkov
-        env:
-          INPUT_SCAN_PATH: ${{ github.event.inputs.scan_path }}
-          INPUT_SOFT_FAIL: ${{ github.event.inputs.soft_fail }}
+      - name: Run Checkov and generate reports
+        shell: bash
         run: |
-          SCAN_PATH="${INPUT_SCAN_PATH:-vulnerable}"
-          SOFT_FAIL="${INPUT_SOFT_FAIL:-false}"
+          mkdir -p reports
 
-          echo "Scanning folder: ${SCAN_PATH}"
-          echo "Soft fail mode: ${SOFT_FAIL}"
+          # Human-readable CLI output in the job log and artifact
+          checkov \
+            -d "${{ steps.cfg.outputs.scan_path }}" \
+            --framework terraform \
+            -o cli \
+            --soft-fail | tee reports/checkov-results.txt
 
-          CHECKOV_ARGS="-d ${SCAN_PATH} --framework terraform --output cli --output json --output-file-path console,checkov-results.json"
-          if [ "${SOFT_FAIL}" = "true" ]; then
-            CHECKOV_ARGS="${CHECKOV_ARGS} --soft-fail"
-          fi
+          # JSON for Markdown summary generation
+          checkov \
+            -d "${{ steps.cfg.outputs.scan_path }}" \
+            --framework terraform \
+            -o json \
+            --soft-fail > reports/checkov-results.json
 
-          checkov ${CHECKOV_ARGS}
+          # SARIF for GitHub Security > Code scanning
+          checkov \
+            -d "${{ steps.cfg.outputs.scan_path }}" \
+            --framework terraform \
+            -o sarif \
+            --custom-tool-name "Checkov IaC Scanner" \
+            --soft-fail > reports/checkov-results.sarif
 
-      - name: Upload Checkov JSON results
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Create GitHub Actions summary and inline annotations
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          python scripts/checkov_to_markdown.py reports/checkov-results.json \
+            --scan-path "${{ steps.cfg.outputs.scan_path }}" \
+            --output reports/checkov-summary.md \
+            --github-annotations \
+            --max-findings 25 \
+            --max-annotations 20
+
+          cat reports/checkov-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SARIF to GitHub code scanning
+        if: ${{ always() && hashFiles('reports/checkov-results.sarif') != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
         with:
-          name: checkov-results
-          path: checkov-results.json
+          sarif_file: reports/checkov-results.sarif
+          category: ${{ steps.cfg.outputs.category }}
+
+      - name: Upload Checkov report artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.cfg.outputs.artifact_name }}
+          path: reports/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Enforce Checkov security gate
+        if: ${{ always() && steps.cfg.outputs.enforce_gate == 'true' }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          result_path = Path("reports/checkov-results.json")
+          if not result_path.exists():
+              print("Security gate failed: no Checkov JSON result was produced.")
+              sys.exit(1)
+
+          data = json.loads(result_path.read_text(encoding="utf-8"))
+          blocks = data if isinstance(data, list) else [data]
+          failed = sum(int((block.get("summary", {}) or {}).get("failed", 0) or 0) for block in blocks if isinstance(block, dict))
+
+          if failed > 0:
+              print(f"Security gate failed: {failed} Checkov failed checks were found.")
+              sys.exit(1)
+
+          print("Security gate passed: no failed Checkov checks found.")
+          PY
